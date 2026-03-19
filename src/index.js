@@ -19,6 +19,12 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import fs from "fs";
 import path from "path";
+import {
+  loadJobs, saveJobs, trackJob, updateJob,
+  uploadFile, downloadFile,
+  createBatchJob, getBatchStatus, listBatchJobs,
+  buildJsonlFile, processBatchResults,
+} from "./batch.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -207,7 +213,7 @@ function buildMcpContent(parsed, outputPath) {
 
 const server = new McpServer({
   name: "nanobanana-mcp-server",
-  version: "1.1.0",
+  version: "1.2.0",
 });
 
 // ---- Tool: generate_image ----------------------------------------------------
@@ -444,6 +450,400 @@ Examples:
       return {
         isError: true,
         content: [{ type: "text", text: `Error editing image: ${error.message}` }],
+      };
+    }
+  }
+);
+
+// ---- Tool: batch_submit -----------------------------------------------------
+
+server.registerTool(
+  "gemini_batch_submit",
+  {
+    title: "Batch Submit",
+    description:
+      `Submit a batch of image generation requests to the Gemini API at 50% reduced cost.
+
+Creates a JSONL input file (saved locally for debugging), uploads it to the Gemini Files API,
+and submits a batch job. The job processes asynchronously (usually completes within 24 hours).
+Use gemini_batch_status to check progress and gemini_batch_results to retrieve images.
+
+Args:
+  - requests (string, required): JSON array of request objects. Each object must have:
+      - key (string): Unique identifier for this request (used as output filename)
+      - prompt (string): The image generation prompt
+      - aspect_ratio (string, optional): Aspect ratio for this image
+      - image_paths (string, optional): Comma-separated input image paths for editing
+    Example: [{"key":"sunset-cat","prompt":"A cat watching a sunset","aspect_ratio":"16:9"}]
+  - output_dir (string, required): Directory where completed images will be saved.
+  - model (string, optional): Gemini model ID. Defaults to "${DEFAULT_MODEL}".
+  - display_name (string, optional): Human-readable name for the batch job.
+
+Returns:
+  - The batch job name/ID for tracking, plus the JSONL file path for debugging.`,
+
+    inputSchema: {
+      requests: z.string()
+        .describe('JSON array of {key, prompt, aspect_ratio?, image_paths?} objects'),
+      output_dir: z.string()
+        .describe("Directory where completed images will be saved"),
+      model: z.string()
+        .default(DEFAULT_MODEL)
+        .describe(`Gemini model ID (default: ${DEFAULT_MODEL})`),
+      display_name: z.string()
+        .optional()
+        .describe("Human-readable name for the batch job"),
+    },
+
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+  },
+
+  async ({ requests, output_dir, model, display_name }) => {
+    try {
+      const apiKey = getApiKey();
+
+      // Parse requests
+      let parsedRequests;
+      try {
+        parsedRequests = JSON.parse(requests);
+      } catch {
+        return {
+          isError: true,
+          content: [{ type: "text", text: "Error: requests must be a valid JSON array." }],
+        };
+      }
+
+      if (!Array.isArray(parsedRequests) || parsedRequests.length === 0) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: "Error: requests must be a non-empty JSON array." }],
+        };
+      }
+
+      // Validate each request has key and prompt
+      for (const req of parsedRequests) {
+        if (!req.key || !req.prompt) {
+          return {
+            isError: true,
+            content: [{ type: "text", text: `Error: Each request must have "key" and "prompt". Got: ${JSON.stringify(req)}` }],
+          };
+        }
+      }
+
+      const useModel = model || DEFAULT_MODEL;
+      const jobDisplayName = display_name || `nanobanana-batch-${Date.now()}`;
+
+      // 1. Build JSONL file
+      const jsonlPath = buildJsonlFile(parsedRequests, useModel);
+
+      // 2. Upload to Gemini Files API
+      const fileName = await uploadFile(jsonlPath, apiKey);
+
+      // 3. Create batch job
+      const batchJob = await createBatchJob(useModel, fileName, apiKey, jobDisplayName);
+      const batchName = batchJob.name;
+
+      // 4. Track the job locally
+      trackJob({
+        batchName,
+        displayName: jobDisplayName,
+        model: useModel,
+        state: batchJob.state || "JOB_STATE_PENDING",
+        inputFile: fileName,
+        jsonlPath,
+        outputDir: output_dir,
+        requestCount: parsedRequests.length,
+        requestKeys: parsedRequests.map(r => r.key),
+        createdAt: new Date().toISOString(),
+        completedAt: null,
+        outputFile: null,
+        error: null,
+      });
+
+      return {
+        content: [{
+          type: "text",
+          text: [
+            `Batch job submitted successfully!`,
+            ``,
+            `  Batch ID:    ${batchName}`,
+            `  Display Name: ${jobDisplayName}`,
+            `  Requests:    ${parsedRequests.length}`,
+            `  Model:       ${useModel}`,
+            `  JSONL File:  ${jsonlPath}`,
+            `  Output Dir:  ${output_dir}`,
+            ``,
+            `Use gemini_batch_status to check progress.`,
+            `Use gemini_batch_results to download images when complete.`,
+          ].join("\n"),
+        }],
+      };
+    } catch (error) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: `Error submitting batch: ${error.message}` }],
+      };
+    }
+  }
+);
+
+// ---- Tool: batch_status -----------------------------------------------------
+
+server.registerTool(
+  "gemini_batch_status",
+  {
+    title: "Batch Status",
+    description:
+      `Check the status of one or all pending batch image generation jobs.
+
+Args:
+  - batch_name (string, optional): Specific batch ID to check (e.g. "batches/abc123").
+    If omitted, checks ALL tracked jobs and updates their status.
+
+Returns:
+  - Current state of each job (PENDING, RUNNING, SUCCEEDED, FAILED, CANCELLED).
+  - For completed jobs, includes the output file reference.`,
+
+    inputSchema: {
+      batch_name: z.string()
+        .optional()
+        .describe('Specific batch ID to check (e.g. "batches/abc123"). Omit to check all.'),
+    },
+
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    },
+  },
+
+  async ({ batch_name }) => {
+    try {
+      const apiKey = getApiKey();
+      const jobs = loadJobs();
+
+      if (jobs.length === 0) {
+        return {
+          content: [{ type: "text", text: "No batch jobs are being tracked." }],
+        };
+      }
+
+      // Filter to specific job or all pending jobs
+      const toCheck = batch_name
+        ? jobs.filter(j => j.batchName === batch_name)
+        : jobs.filter(j => !["JOB_STATE_SUCCEEDED", "JOB_STATE_FAILED", "JOB_STATE_CANCELLED"].includes(j.state));
+
+      if (toCheck.length === 0 && batch_name) {
+        return {
+          content: [{ type: "text", text: `No tracked job found with name: ${batch_name}` }],
+        };
+      }
+
+      const statusLines = [];
+
+      for (const job of toCheck) {
+        try {
+          const status = await getBatchStatus(job.batchName, apiKey);
+          const newState = status.state || job.state;
+
+          const updates = { state: newState };
+
+          if (status.dest?.fileName) {
+            updates.outputFile = status.dest.fileName;
+          }
+          if (newState === "JOB_STATE_SUCCEEDED") {
+            updates.completedAt = new Date().toISOString();
+          }
+          if (status.error) {
+            updates.error = JSON.stringify(status.error);
+          }
+
+          updateJob(job.batchName, updates);
+
+          statusLines.push(
+            `${job.batchName}`,
+            `  Name:      ${job.displayName}`,
+            `  State:     ${newState}`,
+            `  Requests:  ${job.requestCount}`,
+            `  Created:   ${job.createdAt}`,
+            status.dest?.fileName ? `  Output:    ${status.dest.fileName}` : "",
+            ""
+          );
+        } catch (err) {
+          statusLines.push(`${job.batchName}: Error checking status - ${err.message}`, "");
+        }
+      }
+
+      // Also show summary of all jobs
+      const allJobs = loadJobs();
+      const summary = [
+        `--- All Tracked Jobs ---`,
+        `Pending:   ${allJobs.filter(j => j.state === "JOB_STATE_PENDING").length}`,
+        `Running:   ${allJobs.filter(j => j.state === "JOB_STATE_RUNNING").length}`,
+        `Succeeded: ${allJobs.filter(j => j.state === "JOB_STATE_SUCCEEDED").length}`,
+        `Failed:    ${allJobs.filter(j => j.state === "JOB_STATE_FAILED").length}`,
+      ];
+
+      return {
+        content: [{
+          type: "text",
+          text: [...statusLines, ...summary].filter(Boolean).join("\n"),
+        }],
+      };
+    } catch (error) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: `Error checking batch status: ${error.message}` }],
+      };
+    }
+  }
+);
+
+// ---- Tool: batch_results ----------------------------------------------------
+
+server.registerTool(
+  "gemini_batch_results",
+  {
+    title: "Batch Results",
+    description:
+      `Download and save images from a completed batch job.
+
+Retrieves the output JSONL from the Gemini Files API, decodes each image,
+and saves them to the output directory that was specified when the batch was submitted
+(or to a different directory if output_dir is provided here).
+
+Args:
+  - batch_name (string, optional): Specific batch ID to retrieve. If omitted,
+    retrieves results for ALL completed jobs that haven't been downloaded yet.
+  - output_dir (string, optional): Override the output directory for saving images.
+    If omitted, uses the output_dir from when the batch was submitted.
+
+Returns:
+  - List of saved image paths and any errors encountered.`,
+
+    inputSchema: {
+      batch_name: z.string()
+        .optional()
+        .describe('Specific batch ID to retrieve. Omit to process all completed jobs.'),
+      output_dir: z.string()
+        .optional()
+        .describe("Override output directory for saving images"),
+    },
+
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: true,
+    },
+  },
+
+  async ({ batch_name, output_dir }) => {
+    try {
+      const apiKey = getApiKey();
+      const jobs = loadJobs();
+
+      // Find completed jobs that need results downloaded
+      const toProcess = batch_name
+        ? jobs.filter(j => j.batchName === batch_name)
+        : jobs.filter(j => j.state === "JOB_STATE_SUCCEEDED" && !j.resultsDownloaded);
+
+      if (toProcess.length === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: batch_name
+              ? `No job found with name: ${batch_name}`
+              : "No completed jobs with pending results to download.",
+          }],
+        };
+      }
+
+      const allResults = [];
+
+      for (const job of toProcess) {
+        // If the job isn't done yet, check its status first
+        if (job.state !== "JOB_STATE_SUCCEEDED") {
+          const status = await getBatchStatus(job.batchName, apiKey);
+          if (status.state !== "JOB_STATE_SUCCEEDED") {
+            allResults.push(`${job.batchName}: Not yet complete (state: ${status.state})`);
+            continue;
+          }
+          // Update to succeeded
+          updateJob(job.batchName, {
+            state: "JOB_STATE_SUCCEEDED",
+            completedAt: new Date().toISOString(),
+            outputFile: status.dest?.fileName || job.outputFile,
+          });
+          job.outputFile = status.dest?.fileName || job.outputFile;
+        }
+
+        if (!job.outputFile) {
+          allResults.push(`${job.batchName}: No output file reference found.`);
+          continue;
+        }
+
+        const saveDir = output_dir || job.outputDir;
+        if (!saveDir) {
+          allResults.push(`${job.batchName}: No output directory specified.`);
+          continue;
+        }
+
+        try {
+          // Download output JSONL
+          const outputContent = await downloadFile(job.outputFile, apiKey);
+
+          // Save the raw output JSONL for debugging
+          const outputJsonlPath = job.jsonlPath.replace("_input_", "_output_");
+          fs.writeFileSync(outputJsonlPath, outputContent);
+
+          // Process results and save images
+          const results = processBatchResults(outputContent, saveDir);
+
+          // Mark as downloaded
+          updateJob(job.batchName, { resultsDownloaded: true });
+
+          const succeeded = results.filter(r => r.imagePath);
+          const failed = results.filter(r => r.error);
+
+          allResults.push(
+            `${job.batchName} (${job.displayName}):`,
+            `  Images saved: ${succeeded.length}/${results.length}`,
+            `  Output dir:   ${saveDir}`,
+            `  Output JSONL: ${outputJsonlPath}`,
+          );
+
+          if (succeeded.length > 0) {
+            allResults.push(`  Files:`);
+            for (const r of succeeded) {
+              allResults.push(`    - ${r.key}: ${r.imagePath}`);
+            }
+          }
+          if (failed.length > 0) {
+            allResults.push(`  Errors:`);
+            for (const r of failed) {
+              allResults.push(`    - ${r.key}: ${r.error}`);
+            }
+          }
+          allResults.push("");
+        } catch (err) {
+          allResults.push(`${job.batchName}: Error downloading results - ${err.message}`);
+        }
+      }
+
+      return {
+        content: [{ type: "text", text: allResults.join("\n") }],
+      };
+    } catch (error) {
+      return {
+        isError: true,
+        content: [{ type: "text", text: `Error retrieving batch results: ${error.message}` }],
       };
     }
   }
