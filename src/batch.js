@@ -171,11 +171,9 @@ export async function createBatchJob(model, fileName, apiKey, displayName) {
 
   const body = {
     batch: {
-      displayName,
-      inputConfig: {
-        requests: {
-          fileName,
-        },
+      display_name: displayName,
+      input_config: {
+        file_name: fileName,
       },
     },
   };

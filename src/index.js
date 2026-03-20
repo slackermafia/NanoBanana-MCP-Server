@@ -654,8 +654,11 @@ Returns:
 
           const updates = { state: newState };
 
-          if (status.dest?.fileName) {
-            updates.outputFile = status.dest.fileName;
+          const destFile = status.dest?.fileName || status.dest?.file_name
+            || status.output_config?.destination?.file_name
+            || status.outputConfig?.destination?.fileName;
+          if (destFile) {
+            updates.outputFile = destFile;
           }
           if (newState === "JOB_STATE_SUCCEEDED") {
             updates.completedAt = new Date().toISOString();
@@ -672,7 +675,7 @@ Returns:
             `  State:     ${newState}`,
             `  Requests:  ${job.requestCount}`,
             `  Created:   ${job.createdAt}`,
-            status.dest?.fileName ? `  Output:    ${status.dest.fileName}` : "",
+            destFile ? `  Output:    ${destFile}` : "",
             ""
           );
         } catch (err) {
@@ -776,12 +779,15 @@ Returns:
             continue;
           }
           // Update to succeeded
+          const destFile = status.dest?.fileName || status.dest?.file_name
+            || status.output_config?.destination?.file_name
+            || status.outputConfig?.destination?.fileName;
           updateJob(job.batchName, {
             state: "JOB_STATE_SUCCEEDED",
             completedAt: new Date().toISOString(),
-            outputFile: status.dest?.fileName || job.outputFile,
+            outputFile: destFile || job.outputFile,
           });
-          job.outputFile = status.dest?.fileName || job.outputFile;
+          job.outputFile = destFile || job.outputFile;
         }
 
         if (!job.outputFile) {
