@@ -259,11 +259,11 @@ export function buildJsonlFile(requests, model) {
         if (fs.existsSync(p)) {
           const base64 = fs.readFileSync(p).toString("base64");
           const ext = path.extname(p).toLowerCase();
-          let mimeType = "image/png";
-          if (ext === ".jpg" || ext === ".jpeg") mimeType = "image/jpeg";
-          else if (ext === ".webp") mimeType = "image/webp";
-          else if (ext === ".gif") mimeType = "image/gif";
-          parts.push({ inlineData: { mimeType, data: base64 } });
+          let mime_type = "image/png";
+          if (ext === ".jpg" || ext === ".jpeg") mime_type = "image/jpeg";
+          else if (ext === ".webp") mime_type = "image/webp";
+          else if (ext === ".gif") mime_type = "image/gif";
+          parts.push({ inline_data: { mime_type, data: base64 } });
         }
       }
     }
@@ -271,20 +271,20 @@ export function buildJsonlFile(requests, model) {
     // Add the text prompt
     parts.push({ text: req.prompt });
 
-    // Build generationConfig
-    const generationConfig = {
-      responseModalities: ["TEXT", "IMAGE"],
+    // Build generation_config (snake_case for Gemini REST/batch API)
+    const generation_config = {
+      response_modalities: ["TEXT", "IMAGE"],
     };
     if (req.aspect_ratio) {
-      generationConfig.imageConfig = { aspectRatio: req.aspect_ratio };
+      generation_config.image_config = { aspect_ratio: req.aspect_ratio };
     }
 
+    // Note: model is NOT included here — it's already specified in the batch URL
     const line = {
       key: req.key,
       request: {
-        model: `models/${model}`,
         contents: [{ parts }],
-        generationConfig,
+        generation_config,
       },
     };
 
@@ -331,8 +331,10 @@ export function processBatchResults(outputJsonl, outputDir) {
 
     for (const candidate of response.candidates) {
       for (const part of candidate?.content?.parts ?? []) {
-        if (part.inlineData) {
-          const mimeType = part.inlineData.mimeType || "image/jpeg";
+        // Handle both camelCase and snake_case from Google's response
+        const imgData = part.inlineData || part.inline_data;
+        if (imgData) {
+          const mimeType = imgData.mimeType || imgData.mime_type || "image/jpeg";
           const ext = mimeType.includes("png") ? ".png"
             : mimeType.includes("webp") ? ".webp"
             : mimeType.includes("gif") ? ".gif"
@@ -340,7 +342,7 @@ export function processBatchResults(outputJsonl, outputDir) {
 
           const fileName = `${key}${ext}`;
           imagePath = path.join(outputDir, fileName);
-          fs.writeFileSync(imagePath, Buffer.from(part.inlineData.data, "base64"));
+          fs.writeFileSync(imagePath, Buffer.from(imgData.data, "base64"));
         }
         if (part.text) {
           text = text ? text + "\n" + part.text : part.text;
