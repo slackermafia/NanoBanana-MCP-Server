@@ -244,7 +244,7 @@ export async function listBatchJobs(apiKey) {
  * @param {string} model
  * @returns {string} - Path to the saved JSONL file
  */
-export function buildJsonlFile(requests, model) {
+export function buildJsonlFile(requests, model, imageSize = "2K") {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const jsonlPath = path.join(DATA_DIR, `batch_input_${timestamp}.jsonl`);
 
@@ -272,11 +272,15 @@ export function buildJsonlFile(requests, model) {
     parts.push({ text: req.prompt });
 
     // Build generation_config (snake_case for Gemini REST/batch API)
+    const image_config = {};
+    if (imageSize) image_config.image_size = imageSize;
+    if (req.aspect_ratio) image_config.aspect_ratio = req.aspect_ratio;
+
     const generation_config = {
       response_modalities: ["TEXT", "IMAGE"],
     };
-    if (req.aspect_ratio) {
-      generation_config.image_config = { aspect_ratio: req.aspect_ratio };
+    if (Object.keys(image_config).length > 0) {
+      generation_config.image_config = image_config;
     }
 
     // Note: model is NOT included here — it's already specified in the batch URL

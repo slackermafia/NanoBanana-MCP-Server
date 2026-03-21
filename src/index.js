@@ -96,7 +96,7 @@ function loadImagePart(filePath) {
  * @param {string} [options.aspectRatio]      - e.g. "16:9"
  * @returns {Promise<object>}                 - Raw JSON response from Gemini
  */
-async function callGemini({ model, parts, responseModalities, aspectRatio }) {
+async function callGemini({ model, parts, responseModalities, aspectRatio, imageSize }) {
   const apiKey = getApiKey();
   const url = `${GEMINI_API_BASE}/${model}:generateContent?key=${apiKey}`;
 
@@ -104,8 +104,11 @@ async function callGemini({ model, parts, responseModalities, aspectRatio }) {
     responseModalities: responseModalities ?? ["TEXT", "IMAGE"],
   };
 
-  if (aspectRatio) {
-    generationConfig.imageConfig = { aspectRatio };
+  const imageConfig = {};
+  if (aspectRatio) imageConfig.aspectRatio = aspectRatio;
+  if (imageSize) imageConfig.imageSize = imageSize;
+  if (Object.keys(imageConfig).length > 0) {
+    generationConfig.imageConfig = imageConfig;
   }
 
   const body = {
@@ -250,6 +253,9 @@ Examples:
       model: z.string()
         .default(DEFAULT_MODEL)
         .describe(`Gemini model ID (default: ${DEFAULT_MODEL})`),
+      image_size: z.string()
+        .optional()
+        .describe('Output image resolution: "1K" (1024px), "2K" (2048px), or "4K" (4096px)'),
       output_path: z.string()
         .optional()
         .describe("Optional file path to save the generated image"),
@@ -263,7 +269,7 @@ Examples:
     },
   },
 
-  async ({ prompt, aspect_ratio, model, output_path }) => {
+  async ({ prompt, aspect_ratio, model, image_size, output_path }) => {
     try {
       if (aspect_ratio && !SUPPORTED_ASPECT_RATIOS.includes(aspect_ratio)) {
         return {
@@ -281,6 +287,7 @@ Examples:
         parts,
         responseModalities: ["TEXT", "IMAGE"],
         aspectRatio: aspect_ratio,
+        imageSize: image_size,
       });
 
       const parsed = parseGeminiResponse(response);
@@ -341,6 +348,9 @@ Examples:
       model: z.string()
         .default(DEFAULT_MODEL)
         .describe(`Gemini model ID (default: ${DEFAULT_MODEL})`),
+      image_size: z.string()
+        .optional()
+        .describe('Output image resolution: "1K" (1024px), "2K" (2048px), or "4K" (4096px)'),
       output_path: z.string()
         .optional()
         .describe("Optional file path to save the edited image"),
@@ -354,7 +364,7 @@ Examples:
     },
   },
 
-  async ({ prompt, image_paths, image_base64_list, aspect_ratio, model, output_path }) => {
+  async ({ prompt, image_paths, image_base64_list, aspect_ratio, model, image_size, output_path }) => {
     try {
       const imageParts = [];
 
@@ -442,6 +452,7 @@ Examples:
         parts,
         responseModalities: ["TEXT", "IMAGE"],
         aspectRatio: aspect_ratio,
+        imageSize: image_size,
       });
 
       const parsedResponse = parseGeminiResponse(response);
@@ -477,6 +488,7 @@ Args:
     Example: [{"key":"sunset-cat","prompt":"A cat watching a sunset","aspect_ratio":"16:9"}]
   - output_dir (string, required): Directory where completed images will be saved.
   - model (string, optional): Gemini model ID. Defaults to "${DEFAULT_MODEL}".
+  - image_size (string, optional): Output image resolution. Values: "1K" (1024px), "2K" (2048px), "4K" (4096px). Defaults to "2K".
   - display_name (string, optional): Human-readable name for the batch job.
 
 Returns:
@@ -490,6 +502,9 @@ Returns:
       model: z.string()
         .default(DEFAULT_MODEL)
         .describe(`Gemini model ID (default: ${DEFAULT_MODEL})`),
+      image_size: z.string()
+        .default("2K")
+        .describe('Output image resolution: "1K" (1024px), "2K" (2048px), or "4K" (4096px). Default: "2K"'),
       display_name: z.string()
         .optional()
         .describe("Human-readable name for the batch job"),
@@ -503,7 +518,7 @@ Returns:
     },
   },
 
-  async ({ requests, output_dir, model, display_name }) => {
+  async ({ requests, output_dir, model, image_size, display_name }) => {
     try {
       const apiKey = getApiKey();
 
@@ -539,7 +554,7 @@ Returns:
       const jobDisplayName = display_name || `nanobanana-batch-${Date.now()}`;
 
       // 1. Build JSONL file
-      const jsonlPath = buildJsonlFile(parsedRequests, useModel);
+      const jsonlPath = buildJsonlFile(parsedRequests, useModel, image_size || "2K");
 
       // 2. Upload to Gemini Files API
       const fileName = await uploadFile(jsonlPath, apiKey);
