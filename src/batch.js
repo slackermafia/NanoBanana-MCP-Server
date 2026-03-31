@@ -2,26 +2,14 @@
  * Batch API helpers for the NanoBanana MCP Server.
  *
  * Handles: JSONL creation, file upload to Gemini Files API,
- * batch job submission, status polling, and result retrieval.
+ * batch job submission, status checking, and result retrieval.
  *
- * Job tracking is persisted to data/batch_jobs.json.
+ * No local state — batch tracking is handled by the caller (e.g. Supabase).
  */
 
 import fs from "fs";
+import os from "os";
 import path from "path";
-import { fileURLToPath } from "url";
-
-// ---------------------------------------------------------------------------
-// Paths
-// ---------------------------------------------------------------------------
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const DATA_DIR = path.join(__dirname, "..", "data");
-const JOBS_FILE = path.join(DATA_DIR, "batch_jobs.json");
-
-// Ensure data directory exists
-fs.mkdirSync(DATA_DIR, { recursive: true });
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -29,53 +17,6 @@ fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const GEMINI_API = "https://generativelanguage.googleapis.com";
 const FILES_UPLOAD_URL = `${GEMINI_API}/upload/v1beta/files`;
-const BATCHES_URL = `${GEMINI_API}/v1beta/batches`;
-
-// ---------------------------------------------------------------------------
-// Job tracking persistence
-// ---------------------------------------------------------------------------
-
-/**
- * Load all tracked batch jobs from disk.
- * @returns {Array<object>}
- */
-export function loadJobs() {
-  if (!fs.existsSync(JOBS_FILE)) return [];
-  try {
-    return JSON.parse(fs.readFileSync(JOBS_FILE, "utf-8"));
-  } catch {
-    return [];
-  }
-}
-
-/**
- * Save the full jobs array to disk.
- */
-export function saveJobs(jobs) {
-  fs.writeFileSync(JOBS_FILE, JSON.stringify(jobs, null, 2));
-}
-
-/**
- * Append a new job record and persist.
- */
-export function trackJob(job) {
-  const jobs = loadJobs();
-  jobs.push(job);
-  saveJobs(jobs);
-}
-
-/**
- * Update a job by its batch name and persist.
- */
-export function updateJob(batchName, updates) {
-  const jobs = loadJobs();
-  const idx = jobs.findIndex(j => j.batchName === batchName);
-  if (idx !== -1) {
-    Object.assign(jobs[idx], updates);
-    saveJobs(jobs);
-  }
-  return jobs[idx] ?? null;
-}
 
 // ---------------------------------------------------------------------------
 // Gemini Files API helpers
@@ -160,11 +101,11 @@ export async function downloadFile(fileName, apiKey) {
 /**
  * Create a batch job from an uploaded JSONL file.
  *
- * @param {string} model      - Model ID (e.g. "gemini-3-pro-image-preview")
+ * @param {string} model      - Model ID (e.g. "gemini-3.1-flash-image-preview")
  * @param {string} fileName   - Uploaded file name from Files API
  * @param {string} apiKey     - Gemini API key
  * @param {string} displayName - Human-readable batch name
- * @returns {Promise<object>}  - Batch job object from Gemini
+ * @returns {Promise<object>}  - Raw batch job response from Gemini
  */
 export async function createBatchJob(model, fileName, apiKey, displayName) {
   const url = `${GEMINI_API}/v1beta/models/${model}:batchGenerateContent?key=${apiKey}`;
@@ -197,7 +138,7 @@ export async function createBatchJob(model, fileName, apiKey, displayName) {
  *
  * @param {string} batchName - e.g. "batches/abc123"
  * @param {string} apiKey
- * @returns {Promise<object>}
+ * @returns {Promise<object>} - Raw status response (state at metadata.state)
  */
 export async function getBatchStatus(batchName, apiKey) {
   const url = `${GEMINI_API}/v1beta/${batchName}?key=${apiKey}`;
@@ -213,46 +154,34 @@ export async function getBatchStatus(batchName, apiKey) {
   return res.json();
 }
 
-/**
- * List all batch jobs.
- *
- * @param {string} apiKey
- * @returns {Promise<object>}
- */
-export async function listBatchJobs(apiKey) {
-  const url = `${BATCHES_URL}?key=${apiKey}`;
-  const res = await fetch(url, {
-    headers: { "Content-Type": "application/json" },
-  });
-
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`Batch list failed (${res.status}): ${err}`);
-  }
-
-  return res.json();
-}
-
 // ---------------------------------------------------------------------------
 // JSONL builder
 // ---------------------------------------------------------------------------
 
 /**
- * Build a JSONL file from an array of prompt objects and save it to disk.
+ * Build a JSONL file from an array of prompt objects. Writes to a temp file
+ * for upload, then cleans up after.
  *
  * @param {Array<{key: string, prompt: string, aspect_ratio?: string, image_paths?: string}>} requests
- * @param {string} model
- * @returns {string} - Path to the saved JSONL file
+ * @param {string} model - Not embedded in JSONL (model is in the batch URL), kept for signature compat
+ * @param {string} imageSize - Output resolution: "1K", "2K", or "4K" (default "2K")
+ * @param {Array<string>} sharedFileUris - Pre-uploaded Gemini file URIs to include in ALL requests (fast, no base64)
+ * @returns {string} - Path to the temp JSONL file (caller should clean up after upload)
  */
-export function buildJsonlFile(requests, model, imageSize = "2K") {
+export function buildJsonlFile(requests, model, imageSize = "2K", sharedFileUris = []) {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const jsonlPath = path.join(DATA_DIR, `batch_input_${timestamp}.jsonl`);
+  const jsonlPath = path.join(os.tmpdir(), `nanobanana_batch_${timestamp}.jsonl`);
 
   const lines = requests.map(req => {
     // Build the parts array
     const parts = [];
 
-    // Add reference images if provided
+    // Add shared pre-uploaded reference images (fast — just URI references)
+    for (const uri of sharedFileUris) {
+      parts.push({ file_data: { file_uri: uri, mime_type: "image/jpeg" } });
+    }
+
+    // Add per-request images from file paths (slow — base64 encodes each file)
     if (req.image_paths) {
       const paths = req.image_paths.split(",").map(p => p.trim()).filter(Boolean);
       for (const p of paths) {
@@ -283,7 +212,7 @@ export function buildJsonlFile(requests, model, imageSize = "2K") {
       generation_config.image_config = image_config;
     }
 
-    // Note: model is NOT included here — it's already specified in the batch URL
+    // Note: model is NOT included — it's already specified in the batch URL
     const line = {
       key: req.key,
       request: {
